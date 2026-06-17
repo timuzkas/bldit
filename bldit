@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""bldit - build anything with local LLM via llama.cpp"""
+
+import json, os, sys, subprocess, tempfile, shutil, time, re, argparse, threading
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+
+CONFIG_DIR = Path("~/.config/bldit").expanduser()
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+DEFAULT_CONFIG = {
+    "base_url": "http://localhost:8080/v1",
+    "api_key": "",
+    "model": None,
+    "always_allow_tools": ["read_file", "grep"],
+    "prompt_additions": "",
+}
+
+# ── ansi styling ──
+
+C = lambda code, text: f"\033[{code}m{text}\033[0m"
+DIM = lambda t: C("2", t)
+BOLD = lambda t: C("1", t)
+GREEN = lambda t: C("32", t)
+CYAN = lambda t: C("36", t)
+YELLOW = lambda t: C("33", t)
+RED = lambda t: C("31", t)
+BLUE = lambda t: C("34", t)
+MAGENTA = lambda t: C("35", t)
+DIM_GREEN = lambda t: C("2;32", t)
+
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+def strip_md(text):
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    text = re.sub(r'^###?\s+', '', text, flags=re.MULTILINE)
+    return text.strip()
+
+# ── config ──
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        if CONFIG_FILE.exists():
+            loaded = json.loads(CONFIG_FILE.read_text())
+            cfg.update(loaded)
+    except Exception:
+        pass
+    return cfg
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+# ── helpers ──
+
+def os_context():
+    info = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    info[k] = v.strip("\"'")
+    except Exception:
+        pass
+    os_id = info.get("ID", "linux")
+    ver = info.get("VERSION_ID", "")
+    try:
+        shell = os.path.basename(os.environ.get("SHELL", "unknown"))
+    except Exception:
+        shell = "unknown"
+    return f"OS: {os_id} {ver}, Shell: {shell}"
+
+def read_readme(repo_dir):
+    for name in ("README.md", "README.txt", "README", "readme.md", "README.rst", "INSTALL.md"):
+        p = Path(repo_dir) / name
+        if p.exists():
+            return p.read_text(errors="replace")[:10000]
+    return "(no README found)"
+
+def file_tree(repo_dir, max_lines=80):
+    try:
+        r = subprocess.run(
+            ["find", repo_dir, "-maxdepth", "3", "-not", "-path", "*/venv/*",
+             "-not", "-path", "*/node_modules/*", "-not", "-path", "*/.git/*",
+             "-not", "-path", "*/__pycache__/*", "-not", "-path", "*/build/*",
+             "-not", "-path", "*/dist/*", "-not", "-path", "*/target/*",
+             "-not", "-path", "*/vendor/*", "-not", "-path", "*/CMakeFiles/*"],
+            capture_output=True, text=True, timeout=10
+        )
+        lines = [l.replace(repo_dir, ".").strip() for l in r.stdout.split("\n") if l.strip()]
+        lines.sort()
+        if len(lines) > max_lines:
+            lines = lines[:max_lines] + [f"... ({len(lines) - max_lines} more)"]
+        return "\n".join(lines) if lines else "(empty)"
+    except Exception as e:
+        return f"(error: {e})"
+
+# ── spinner ──
+
+class Spinner:
+    def __init__(self):
+        self._stop = False
+        self._msg = ""
+        self._thread = None
+
+    def start(self, msg="working"):
+        self._msg = msg
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def message(self, msg):
+        self._msg = msg
+
+    def stop(self):
+        self._stop = True
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        sys.stdout.write("\r" + " " * shutil.get_terminal_size().columns + "\r")
+        sys.stdout.flush()
+
+    def _run(self):
+        i = 0
+        while not self._stop:
+            ch = SPIN[i % len(SPIN)]
+            sys.stdout.write(f"\r  {BLUE(ch)} {DIM(self._msg)}")
+            sys.stdout.flush()
+            time.sleep(0.08)
+            i += 1
+
+# ── server ──
+
+class ServerManager:
+    def __init__(self, cfg):
+        self.base_url = cfg["base_url"].rstrip("/")
+        self.headers = {}
+        if cfg.get("api_key"):
+            self.headers["Authorization"] = f"Bearer {cfg['api_key']}"
+
+    def is_running(self):
+        try:
+            r = requests.get(f"{self.base_url}/models", timeout=3, headers=self.headers)
+            return r.ok
+        except Exception:
+            return False
+
+    def start(self, model):
+        port = 8080
+        m = re.search(r":(\d+)", self.base_url)
+        if m:
+            port = int(m.group(1))
+        cmd = ["llama-server", "-hf", model, "--port", str(port)]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            t0 = time.time()
+            while time.time() - t0 < 90:
+                if self.is_running():
+                    return True
+                time.sleep(1)
+            return False
+        except FileNotFoundError:
+            return False
+
+# ── llm ──
+
+class LLM:
+    def __init__(self, cfg):
+        self.base_url = cfg["base_url"].rstrip("/")
+        self.model = cfg.get("model")
+        self.headers = {}
+        if cfg.get("api_key"):
+            self.headers["Authorization"] = f"Bearer {cfg['api_key']}"
+
+    def chat_stream(self, messages, tools=None, temperature=0.3, status=""):
+        payload = {
+            "messages": messages,
+            "stream": True,
+            "temperature": temperature,
+        }
+        if self.model:
+            payload["model"] = self.model
+        if tools:
+            payload["tools"] = tools
+
+        resp = requests.post(
+            f"{self.base_url}/chat/completions",
+            json=payload, stream=True, timeout=180,
+            headers=self.headers,
+        )
+        resp.raise_for_status()
+
+        content = ""
+        tool_calls = []
+        finish_reason = "stop"
+        spinner = Spinner()
+        spinner.start(status or "thinking")
+        started = False
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            decoded = line.decode("utf-8").strip()
+            if not decoded.startswith("data: ") or decoded == "data: [DONE]":
+                continue
+            data = json.loads(decoded[6:])
+            choices = data.get("choices", [])
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            fr = choices[0].get("finish_reason")
+            if fr:
+                finish_reason = fr
+
+            chunk = delta.get("content", "")
+            has_tc = "tool_calls" in delta
+
+            if chunk or has_tc:
+                if not started:
+                    spinner.stop()
+                    started = True
+                if chunk:
+                    content += chunk
+
+            if has_tc:
+                for tc in delta["tool_calls"]:
+                    idx = tc.get("index", 0)
+                    while len(tool_calls) <= idx:
+                        tool_calls.append({
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""}
+                        })
+                    if "id" in tc:
+                        tool_calls[idx]["id"] += tc["id"]
+                    if "function" in tc:
+                        if "name" in tc["function"]:
+                            tool_calls[idx]["function"]["name"] += tc["function"]["name"]
+                        if "arguments" in tc["function"]:
+                            tool_calls[idx]["function"]["arguments"] += tc["function"]["arguments"]
+
+        if not started:
+            spinner.stop()
+
+        return {"content": content, "tool_calls": tool_calls, "finish_reason": finish_reason}
+
+# ── tool schemas ──
+
+PHASE_PARAM = {"phase": {"type": "string", "description": "What you are doing: exploring, analysing, building, fixing, researching, testing, etc."}}
+
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a bash command in the project directory",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string", "description": "Command to run"},
+                    **PHASE_PARAM,
+                },
+                "required": ["cmd"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file with optional line offset and limit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to file"},
+                    "offset": {"type": "integer", "description": "Starting line (1-indexed)"},
+                    "limit": {"type": "integer", "description": "Number of lines to read"},
+                    **PHASE_PARAM,
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search file or directory contents by regex pattern",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string", "description": "File or directory path"},
+                    **PHASE_PARAM,
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web. Returns top result titles and snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    **PHASE_PARAM,
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "question",
+            "description": "Ask the user a question. Use when you need a decision, clarification, or input.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Question to ask"},
+                    "options": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Answer choices (optional)",
+                    },
+                    "allow_note": {
+                        "type": "boolean",
+                        "description": "Let user add a freeform note",
+                    },
+                    **PHASE_PARAM,
+                },
+                "required": ["question"],
+            },
+        },
+    },
+]
+
+# ── tool runners ──
+
+def run_bash(cmd, cwd):
+    try:
+        t0 = time.time()
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120, cwd=cwd)
+        elapsed = time.time() - t0
+        out = r.stdout
+        if r.stderr:
+            out = out + "\n" + r.stderr if out else r.stderr
+        result = out.strip() or "(no output)"
+        return result, r.returncode, elapsed
+    except subprocess.TimeoutExpired:
+        return "(timed out after 120s)", -1, 0
+    except Exception as e:
+        return f"error: {e}", -1, 0
+
+def run_read_file(path, offset=1, limit=0):
+    try:
+        offset = int(offset)
+        limit = int(limit)
+        t0 = time.time()
+        with open(path) as f:
+            if offset > 1 or limit > 0:
+                lines = f.readlines()
+                start = max(0, offset - 1)
+                end = start + limit if limit > 0 else len(lines)
+                result = "".join(lines[start:end])
+            else:
+                result = f.read()
+        return result, time.time() - t0
+    except Exception as e:
+        return f"error: {e}", 0
+
+def run_grep(pattern, path):
+    try:
+        t0 = time.time()
+        r = subprocess.run(["rg", "-n", pattern, path], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return r.stdout, time.time() - t0
+        r = subprocess.run(["grep", "-rn", pattern, path], capture_output=True, text=True, timeout=10)
+        return (r.stdout or r.stderr or "(no matches)"), time.time() - t0
+    except Exception as e:
+        return f"error: {e}", 0
+
+def run_web_search(query):
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+        t0 = time.time()
+        res = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query}, timeout=10, headers=headers,
+        )
+        titles = re.findall(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', res.text, re.DOTALL)
+        snippets = re.findall(r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', res.text, re.DOTALL)
+        links = re.findall(r'class="result__a"[^>]*href="(.*?)"', res.text, re.DOTALL)
+        parts = []
+        for i, t in enumerate(titles):
+            title = re.sub(r'<[^>]+>', "", t).strip()
+            url = links[i] if i < len(links) else ""
+            parts.append(f"  {title}  ({url})")
+            if i < len(snippets):
+                s = re.sub(r'<[^>]+>', "", snippets[i]).strip()
+                parts.append(f"    {s}")
+        return ("\n".join(parts[:15]) if parts else "(no results)"), time.time() - t0
+    except Exception as e:
+        return f"error: {e}", 0
+
+def _getch():
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        b = sys.stdin.buffer.read(1)
+        if b == b"\x1b":
+            seq = sys.stdin.buffer.read(2)
+            if seq == b"[A":
+                return "UP"
+            elif seq == b"[B":
+                return "DOWN"
+            elif seq == b"[C":
+                return "RIGHT"
+            elif seq == b"[D":
+                return "LEFT"
+            elif seq:
+                return None
+            return "ESC"
+        elif b in (b"\r", b"\n"):
+            return "ENTER"
+        elif b == b"\x03":
+            raise KeyboardInterrupt()
+        elif b == b"\x04":
+            return "EOF"
+        elif b == b"\x7f":
+            return "BACKSPACE"
+        else:
+            try:
+                return b.decode()
+            except:
+                return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+def run_question(question, options=None, allow_note=False):
+    print()
+    nopts = len(options) if options else 0
+
+    def draw_picker(options, sel):
+        print(f"  {YELLOW('?')} {BOLD(question)}")
+        for i, opt in enumerate(options):
+            pf = CYAN("▸") if i == sel else " "
+            print(f"  {pf} {opt}")
+        print(f"  {DIM('  arrows · enter to select · 0-9 to jump')}")
+
+    if options:
+        sel = 0
+        draw_picker(options, sel)
+        while True:
+            k = _getch()
+            if k == "UP" and sel > 0:
+                sel -= 1
+            elif k == "DOWN" and sel < nopts - 1:
+                sel += 1
+            elif k == "ENTER":
+                break
+            elif k in "0123456789":
+                n = int(k)
+                if n == 0:
+                    sel = -1
+                    break
+                elif 1 <= n <= nopts:
+                    sel = n - 1
+                    break
+            elif k == "ESC":
+                sel = -1
+                break
+            print(f"\033[{nopts + 2}A", end="", flush=True)  # up: options + hint + question
+            draw_picker(options, sel)
+
+        print(f"\033[{nopts + 2}A\033[J", end="", flush=True)  # clear picker area
+        print(f"  {YELLOW('?')} {BOLD(question)}")
+        if sel == -1:
+            answer = input(f"  {DIM('your answer:')} ").strip()
+        else:
+            answer = options[sel]
+            print(f"  {CYAN('▸')} {answer}")
+    else:
+        print(f"  {YELLOW('?')} {BOLD(question)}")
+        answer = input(f"  > ").strip()
+
+    note = ""
+    if allow_note:
+        note = input(f"  {DIM('note (optional):')} ").strip()
+    result = f"answer: {answer}"
+    if note:
+        result += f"\nuser_note: {note}"
+    return result
+
+# ── output helpers ──
+
+def preview(text, max_lines=6, max_chars=300):
+    lines = text.split("\n")
+    short = []
+    for l in lines:
+        short.append(l[:120])
+    if len("\n".join(short)) > max_chars:
+        short = short[:max_lines]
+        return "\n".join(short) + "\n..."
+    if len(short) > max_lines:
+        short = short[:max_lines]
+        return "\n".join(short) + DIM(f"\n  … {len(lines) - max_lines} more lines")
+    return "\n".join(short)
+
+def fmt_time(secs):
+    if secs < 1:
+        return f"{int(secs * 1000)}ms"
+    return f"{secs:.1f}s"
+
+# ── tool dispatch ──
+
+def execute_tool(tc, repo_dir, ask_each):
+    fn = tc["function"]
+    name = fn["name"]
+    try:
+        args = json.loads(fn["arguments"])
+    except Exception:
+        args = {}
+
+    is_question = name == "question"
+
+    if ask_each and name not in ("read_file", "grep", "question"):
+        print(f"  {YELLOW('?')} run {BOLD(name)}: {DIM(json.dumps(args)[:150])}")
+        confirm = input(f"  {YELLOW('Run? [Y/n]')} ").strip().lower()
+        if confirm == "n":
+            print(f"  {RED('✗')} {DIM('skipped')}")
+            return "(skipped by user)"
+
+    if name == "bash":
+        cwd = args.get("cwd") or repo_dir
+        result, code, elapsed = run_bash(args.get("cmd", ""), cwd)
+        MAX_TOOL_OUTPUT = 80000
+        if len(result) > MAX_TOOL_OUTPUT:
+            result = result[:MAX_TOOL_OUTPUT] + "\n... (output truncated)"
+
+        if not is_question:
+            label = args.get("cmd", "")[:100]
+            status = GREEN("✓") if code == 0 else RED(f"✗ exit={code}")
+            print(f"  {DIM(f'└─ {label}')}")
+
+        return result
+
+    elif name == "read_file":
+        path = args.get("path", "")
+        if not os.path.isabs(path):
+            path = os.path.join(repo_dir, path)
+        result, elapsed = run_read_file(path, args.get("offset", 1), args.get("limit", 0))
+        if not is_question:
+            label = os.path.relpath(path, repo_dir) if path.startswith(repo_dir) else path
+            size = len(result)
+        return result
+
+    elif name == "grep":
+        result, elapsed = run_grep(args.get("pattern", ""), args.get("path", repo_dir))
+        return result
+
+    elif name == "web_search":
+        result, elapsed = run_web_search(args.get("query", ""))
+        return result
+
+    elif name == "question":
+        result = run_question(
+            args.get("question", ""),
+            args.get("options"),
+            args.get("allow_note", False),
+        )
+        return result
+
+    else:
+        return f"unknown tool: {name}"
+
+# ── build loop ──
+
+def build_project(llm, repo_dir, ask_each=False, do_install=False, extra_prompt=""):
+    t0 = time.time()
+    ctx = os_context()
+    readme = read_readme(repo_dir)
+    ftree = file_tree(repo_dir)
+
+    sys_prompt = (
+        f"You are bldit, an automated build assistant. "
+        f"Your task: explore and build the project at {repo_dir}.\n\n"
+        f"System info:\n{ctx}\n\n"
+        f"Project file structure:\n{ftree}\n\n"
+        f"README:\n{readme}\n"
+        f"{'After building, install the project if possible.' if do_install else 'Build the project.'}\n\n"
+        "Rules:\n"
+        "- Explore the project first (read key files, check build system).\n"
+        "- Use bash to run build commands.\n"
+        "- If you hit errors, search the web or ask the user.\n"
+        "- If you start a test server, use a port OTHER than 8080 (that's llama.cpp). Try 9999.\n"
+        "- Use the question tool when: stuck on an error, multiple approaches exist, need user preference, or need permission for risky commands (sudo, rm -rf, overwrites).\n"
+        "- When done, give a clear summary starting with BUILD RESULT:\n"
+        + (extra_prompt + "\n" if extra_prompt else "")
+    )
+
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": f"Build the project at {repo_dir}. Explore and build it."},
+    ]
+
+    max_iter = 60
+    last_phase = ""
+    for i in range(max_iter):
+        phase = last_phase or "working"
+        tag = f"  {DIM(phase)}" if phase else ""
+        print(f"\n{DIM(f'── step {i+1}{tag} ──')}")
+
+        response = llm.chat_stream(messages, tools=TOOL_SCHEMAS, status=phase)
+        content = response.get("content", "")
+        tool_calls = response.get("tool_calls", [])
+        finish_reason = response.get("finish_reason", "")
+
+        if not tool_calls:
+            print(f"  {GREEN('✓')} {DIM('done')}")
+            total_steps = i + 1
+            return {"result": content, "steps": total_steps, "time": time.time() - t0}
+
+        assistant_msg = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = [
+                {"id": tc["id"], "type": tc["type"], "function": tc["function"]}
+                for tc in tool_calls
+            ]
+        messages.append(assistant_msg)
+
+        for tc in tool_calls:
+            fn = tc["function"]
+            name = fn["name"]
+            try:
+                args = json.loads(fn["arguments"])
+            except Exception:
+                args = {}
+
+            phase = args.get("phase", "")
+            if phase:
+                last_phase = phase[:60]
+            elif name == "bash":
+                last_phase = args.get("cmd", "")[:50]
+            elif name == "read_file":
+                last_phase = os.path.basename(args.get("path", ""))[:40]
+            elif name == "web_search":
+                last_phase = f"?{args.get('query', '')[:30]}"
+            elif name == "question":
+                last_phase = "asking you"
+
+            if name == "bash":
+                label = args.get("cmd", "")[:80]
+                print(f"  {BLUE('→')} {BOLD(name)} {CYAN(label)}")
+                result = execute_tool(tc, repo_dir, ask_each)
+                if result.strip():
+                    pr = preview(result, max_lines=5, max_chars=600)
+                    for line in pr.split("\n"):
+                        print(f"  {DIM('│')} {line}")
+            elif name == "read_file":
+                result = execute_tool(tc, repo_dir, ask_each)
+                size = len(result)
+                label = args.get("path", "")[:60]
+                print(f"  {DIM(f'{label}')}  {DIM_GREEN(f'• {size} chars')}")
+            elif name == "grep":
+                result = execute_tool(tc, repo_dir, ask_each)
+                size = len(result)
+                pat = args.get("pattern", "")[:40]
+                print(f"  {DIM(f'{name} {pat}')}  {DIM_GREEN(f'• {size} chars')}")
+            elif name == "web_search":
+                q = args.get("query", "")[:80]
+                print(f"  {BLUE('→')} {BOLD(name)} {CYAN(q)}")
+                result = execute_tool(tc, repo_dir, ask_each)
+                if result.strip():
+                    pr = preview(result, max_lines=6, max_chars=500)
+                    for line in pr.split("\n"):
+                        print(f"  {DIM('│')} {line}")
+            elif name == "question":
+                result = execute_tool(tc, repo_dir, ask_each)
+            else:
+                result = execute_tool(tc, repo_dir, ask_each)
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": result,
+            })
+
+        if finish_reason == "length":
+            print(f"  {YELLOW('⚠')} {DIM('context limit reached, continuing...')}")
+
+    print(f"  {RED('✗')} {DIM('max iterations reached')}")
+    return {"result": "(max iterations)", "steps": max_iter, "time": time.time() - t0}
+
+# ── git ──
+
+def clone_repo(url, dest):
+    spinner = Spinner()
+    spinner.start(f"cloning {url}")
+    r = subprocess.run(
+        ["git", "clone", "--depth", "1", url, str(dest)],
+        capture_output=True, text=True, timeout=120,
+    )
+    spinner.stop()
+    if r.returncode != 0:
+        print(f"  {RED('✗')} clone failed")
+        print(DIM(r.stderr[:500]))
+        return False
+    print(f"  {GREEN('✓')} {DIM(f'cloned {url}')}")
+    return True
+
+def repo_name(url):
+    stem = urlparse(url).path.strip("/")
+    return stem.rstrip(".git").split("/")[-1] if "/" in stem else stem
+
+# ── kill command ──
+
+def cmd_kill():
+    r = subprocess.run(["pkill", "-f", "llama-server"], capture_output=True, timeout=5)
+    if r.returncode == 0:
+        print(f"  {GREEN('✓')} llama-server killed")
+    else:
+        print(f"  {DIM('no llama-server process found')}")
+
+def kill_lingering():
+    subprocess.run(["pkill", "-f", "llama-server"], capture_output=True, timeout=5)
+
+# ── main ──
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="bldit - build anything with local LLM via llama.cpp",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  bldit https://github.com/user/repo.git\n"
+            "  bldit https://github.com/user/repo.git --install\n"
+            "  bldit https://github.com/user/repo.git --model deepseek-r1-8b\n"
+            "  bldit path/to/local/repo\n"
+            "  bldit --url https://api.openai.com/v1 --api-key sk-... <repo>\n"
+            "  bldit --kill\n"
+        ),
+    )
+    ap.add_argument("target", nargs="?", help="Git URL or local directory")
+    ap.add_argument("--install", action="store_true", help="Also install after build")
+    ap.add_argument("--ask", action="store_true", help="Confirm each tool call")
+    ap.add_argument("--model", help="LLM model name (e.g. deepseek-r1-8b)")
+    ap.add_argument("--url", help="OpenAI-compatible API base URL")
+    ap.add_argument("--api-key", help="API key (for remote providers)")
+    ap.add_argument("--keep", action="store_true", help="Keep temp dir after build")
+    ap.add_argument("--kill", action="store_true", help="Kill running llama-server")
+    ap.add_argument("--prompt", help="Extra instructions to add to the system prompt")
+    args = ap.parse_args()
+
+    if args.kill:
+        cmd_kill()
+        return
+
+    if not args.target:
+        ap.print_help()
+        sys.exit(1)
+
+    cfg = load_config()
+    if args.model:
+        cfg["model"] = args.model
+        save_config(cfg)
+    if args.url:
+        cfg["base_url"] = args.url.rstrip("/")
+        save_config(cfg)
+    if args.api_key:
+        cfg["api_key"] = args.api_key
+        save_config(cfg)
+
+    def is_local_url(url):
+        host = urlparse(url).hostname or "localhost"
+        return host in ("localhost", "127.0.0.1", "0.0.0.0")
+
+    term = shutil.get_terminal_size().columns
+    print(f"\n  {BOLD(CYAN('bldit'))} {DIM('- build with local LLM')}")
+    print(f"  {DIM('─' * min(term - 2, 50))}")
+
+    sm = ServerManager(cfg)
+    if not sm.is_running():
+        print(f"  {YELLOW('⚠')} {DIM('no server at')} {cfg['base_url']}")
+        if is_local_url(cfg["base_url"]):
+            if not cfg.get("model"):
+                cfg["model"] = input(f"  {CYAN('model name:')} ").strip()
+                save_config(cfg)
+            spinner = Spinner()
+            spinner.start(f"starting llama-server with {cfg['model']}...")
+            if sm.start(cfg["model"]):
+                spinner.stop()
+                print(f"  {GREEN('✓')} {DIM('server ready')}")
+            else:
+                spinner.stop()
+                print(f"  {RED('✗')} {DIM('failed to start server')}")
+                sys.exit(1)
+        else:
+            print(f"  {RED('✗')} {DIM('remote endpoint unreachable — check')} {cfg['base_url']}")
+            sys.exit(1)
+    else:
+        print(f"  {GREEN('✓')} {DIM('server at')} {cfg['base_url']}")
+
+    if not cfg.get("model"):
+        headers = {}
+        if cfg.get("api_key"):
+            headers["Authorization"] = f"Bearer {cfg['api_key']}"
+        llm = LLM(cfg)
+        models = []
+        try:
+            r = requests.get(f"{cfg['base_url'].rstrip('/')}/models", timeout=5, headers=headers)
+            models = [m["id"] for m in r.json().get("data", [])]
+        except Exception:
+            pass
+        if models:
+            cfg["model"] = models[0]
+            save_config(cfg)
+            print(f"  {GREEN('✓')} {DIM('model:')} {cfg['model']}")
+        else:
+            cfg["model"] = input(f"  {CYAN('model name:')} ").strip()
+            save_config(cfg)
+
+    llm = LLM(cfg)
+
+    is_local = os.path.isdir(args.target)
+    tmpdir = None
+
+    try:
+        if is_local:
+            repo_dir = os.path.abspath(args.target)
+            name = os.path.basename(repo_dir)
+            print(f"  {DIM(f'repo  {name}')}")
+        else:
+            tmpdir = tempfile.mkdtemp(prefix="bldit_")
+            name = repo_name(args.target)
+            repo_dir = os.path.join(tmpdir, name) if name else os.path.join(tmpdir, "repo")
+            if not clone_repo(args.target, repo_dir):
+                sys.exit(1)
+
+        print(f"  model {CYAN(cfg.get('model', '?'))}")
+
+        extra_prompt = ""
+        if cfg.get("prompt_additions"):
+            extra_prompt += cfg["prompt_additions"] + "\n"
+        if args.prompt:
+            extra_prompt += args.prompt + "\n"
+        extra_prompt = extra_prompt.strip()
+
+        info = build_project(llm, repo_dir, ask_each=args.ask, do_install=args.install, extra_prompt=extra_prompt)
+
+        if info:
+            elapsed = info.get("time", 0)
+            steps = info.get("steps", "?")
+            text = info.get("result", "")
+
+            term = shutil.get_terminal_size().columns
+            w = min(term - 2, 50)
+            model_name = cfg.get("model", "?")
+            print()
+
+            def anim_line(indent=""):
+                sys.stdout.write(indent)
+                for _ in range(w):
+                    sys.stdout.write(GREEN("─"))
+                    sys.stdout.flush()
+                    time.sleep(0.004)
+                sys.stdout.write("\n")
+
+            pad = "  "
+            sys.stdout.write(f"{pad}{BOLD(GREEN('result'))}\n")
+            sys.stdout.flush()
+            anim_line(pad)
+
+            meta = [
+                ("dir", repo_dir),
+                ("model", model_name),
+                ("steps", str(steps)),
+                ("time", fmt_time(elapsed)),
+            ]
+            mpad = max(len(m[0]) for m in meta) + 1
+            for label, value in meta:
+                sys.stdout.write(f"{pad}{DIM(label.ljust(mpad))} {value}\n")
+                sys.stdout.flush()
+                time.sleep(0.07)
+
+            anim_line(pad)
+            time.sleep(0.1)
+            for line in strip_md(text).split("\n"):
+                sys.stdout.write(f"{pad}{line}\n")
+                sys.stdout.flush()
+                time.sleep(0.015)
+            sys.stdout.flush()
+
+    except KeyboardInterrupt:
+        print(f"\n  {DIM('cancelled')}")
+
+    finally:
+        if tmpdir and not args.keep:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+if __name__ == "__main__":
+    main()
