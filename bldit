@@ -409,40 +409,61 @@ def run_web_search(query):
         return f"error: {e}", 0
 
 def _getch():
-    import termios, tty
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        b = sys.stdin.buffer.read(1)
-        if b == b"\x1b":
-            seq = sys.stdin.buffer.read(2)
-            if seq == b"[A":
-                return "UP"
-            elif seq == b"[B":
-                return "DOWN"
-            elif seq == b"[C":
-                return "RIGHT"
-            elif seq == b"[D":
-                return "LEFT"
-            elif seq:
-                return None
-            return "ESC"
-        elif b in (b"\r", b"\n"):
+    if sys.platform == "win32":
+        import msvcrt
+        b = msvcrt.getch()
+        if b in (b"\xe0", b"\x00"):
+            k = msvcrt.getch()
+            return {b"H": "UP", b"P": "DOWN", b"M": "RIGHT", b"K": "LEFT"}.get(k, None)
+        if b in (b"\r", b"\n"):
             return "ENTER"
-        elif b == b"\x03":
+        if b == b"\x03":
             raise KeyboardInterrupt()
-        elif b == b"\x04":
+        if b == b"\x04":
             return "EOF"
-        elif b == b"\x7f":
+        if b in (b"\x08", b"\x7f"):
             return "BACKSPACE"
-        else:
-            try:
-                return b.decode()
-            except:
-                return None
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        if b == b"\x1b":
+            return "ESC"
+        try:
+            return b.decode()
+        except:
+            return None
+    else:
+        import termios, tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            b = sys.stdin.buffer.read(1)
+            if b == b"\x1b":
+                seq = sys.stdin.buffer.read(2)
+                if seq == b"[A":
+                    return "UP"
+                elif seq == b"[B":
+                    return "DOWN"
+                elif seq == b"[C":
+                    return "RIGHT"
+                elif seq == b"[D":
+                    return "LEFT"
+                elif seq:
+                    return None
+                return "ESC"
+            elif b in (b"\r", b"\n"):
+                return "ENTER"
+            elif b == b"\x03":
+                raise KeyboardInterrupt()
+            elif b == b"\x04":
+                return "EOF"
+            elif b == b"\x7f":
+                return "BACKSPACE"
+            else:
+                try:
+                    return b.decode()
+                except:
+                    return None
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 def run_question(question, options=None, allow_note=False):
     print()
