@@ -466,10 +466,29 @@ def _getch():
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 def run_question(question, options=None, allow_note=False):
-    print()
+    import shutil
     nopts = len(options) if options else 0
+    cols = shutil.get_terminal_size().columns
+
+    def vwidth(s):
+        return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+    def nlines(s, indent=0):
+        w = vwidth(s)
+        avail = cols - indent
+        if avail <= 0:
+            return 1
+        return max(1, (w + avail - 1) // avail)
+
+    def picker_height():
+        h = nlines(question, 2) + 1  # blank line above question
+        for o in (options or []):
+            h += nlines(o, 4)
+        h += nlines("  arrows · enter to select · 0-9 to jump", 2)
+        return h
 
     def draw_picker(options, sel):
+        print()
         print(f"  {YELLOW('?')} {BOLD(question)}")
         for i, opt in enumerate(options):
             pf = CYAN("▸") if i == sel else " "
@@ -498,15 +517,15 @@ def run_question(question, options=None, allow_note=False):
             elif k == "ESC":
                 sel = -1
                 break
-            print(f"\033[{nopts + 2}A", end="", flush=True)  # up: options + hint + question
+            print(f"\033[{picker_height()}A", end="", flush=True)
             draw_picker(options, sel)
 
-        print(f"\033[{nopts + 2}A\033[J", end="", flush=True)  # clear picker area
-        print(f"  {YELLOW('?')} {BOLD(question)}")
+        print(f"\033[{picker_height()}A\033[J", end="", flush=True)
         if sel == -1:
-            answer = input(f"  {DIM('your answer:')} ").strip()
+            answer = input(f"  {YELLOW('?')} {BOLD(question)}\n  {DIM('your answer:')} ").strip()
         else:
             answer = options[sel]
+            print(f"  {YELLOW('?')} {BOLD(question)}")
             print(f"  {CYAN('▸')} {answer}")
     else:
         print(f"  {YELLOW('?')} {BOLD(question)}")
